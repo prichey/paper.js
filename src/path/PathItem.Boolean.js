@@ -148,7 +148,10 @@ PathItem.inject(new function() {
         } else {
             // When there are no crossings, the result can be determined through
             // a much faster call to reorientPaths():
-            paths = reorientPaths(paths2 ? paths1.concat(paths2) : paths1,
+            paths = reorientPaths(
+                    // Make sure reorientPaths() never works on original
+                    // _children arrays by calling paths1.slice()
+                    paths2 ? paths1.concat(paths2) : paths1.slice(),
                     function(w) {
                         return !!operator[w];
                     });
@@ -357,6 +360,7 @@ PathItem.inject(new function() {
                 // be changed to the scaled value after splitting previously.
                 // See CurveLocation#getCurve(), #resolveCrossings()
                 time = loc._time,
+                origTime = time,
                 exclude = include && !include(loc),
                 // Retrieve curve after calling include(), because it may cause
                 // a change in the cached location values, see above.
@@ -371,12 +375,12 @@ PathItem.inject(new function() {
                     // renormalization within the curve.
                     renormalizeLocs = [];
                     prevTime = null;
+                    prevCurve = curve;
                 } else if (prevTime >= tMin) {
                     // Rescale curve-time when we are splitting the same curve
                     // multiple times, if splitting was done previously.
-                    loc._time /= prevTime;
+                    time /= prevTime;
                 }
-                prevCurve = curve;
             }
             if (exclude) {
                 // Store excluded locations for later renormalization, in case
@@ -387,8 +391,7 @@ PathItem.inject(new function() {
             } else if (include) {
                 results.unshift(loc);
             }
-            prevTime = time;
-            time = loc._time;
+            prevTime = origTime;
             if (time < tMin) {
                 segment = curve._segment1;
             } else if (time > tMax) {
@@ -470,7 +473,7 @@ PathItem.inject(new function() {
             pa = pv[ia], // the point's abscissa
             po = pv[io], // the point's ordinate
             // Use separate epsilons for winding contribution code.
-            windingEpsilon = 1e-8,
+            windingEpsilon = 1e-9,
             qualityEpsilon = 1e-6,
             paL = pa - windingEpsilon,
             paR = pa + windingEpsilon,
@@ -509,13 +512,17 @@ PathItem.inject(new function() {
                 // Bail out without updating vPrev at the end of the call.
                 return;
             }
+            // Determine the curve-time value corresponding to the point.
             var t =   po === o0 ? 0
                     : po === o3 ? 1
+                    // If the abscissa is outside the curve, we can use any
+                    // value except 0 (requires special handling). Use 1, as it
+                    // does not require additional calculations for the point.
                     : paL > max(a0, a1, a2, a3) || paR < min(a0, a1, a2, a3)
-                    ? 0.5
-                    : Curve.solveCubic(v, io, po, roots, 0, 1) === 1
+                    ? 1
+                    : Curve.solveCubic(v, io, po, roots, 0, 1) > 0
                         ? roots[0]
-                        : 0.5,
+                        : 1,
                 a =   t === 0 ? a0
                     : t === 1 ? a3
                     : Curve.getPoint(v, t)[dir ? 'y' : 'x'],
@@ -541,22 +548,24 @@ PathItem.inject(new function() {
                 if (winding !== windingPrev) {
                     // Curve is crossed at starting point and winding changes
                     // from previous curve. Cancel winding from previous curve.
-                    if (a3Prev < paR) {
+                    if (a0 < paL) {
                         windingL += winding;
-                    } else if (a3Prev > paL) {
+                    } else if (a0 > paR) {
                         windingR += winding;
                     }
-                } else if (a3Prev < paL && a > paL || a3Prev > paR && a < paR) {
-                    // Point is on a horizontal curve between the previous non-
-                    // horizontal and the current curve.
-                    if (a3Prev < paL) {
-                        // Left winding was added before, now add right winding.
+                } else if (a0 != a3Prev) {
+                    // Handle a horizontal curve  between the current and
+                    // previous non-horizontal curve. See
+                    // #1261#issuecomment-282726147 for a detailed explanation:
+                    if (a3Prev < paR && a > paR) {
+                        // Right winding was not added before, so add it now.
                         windingR += winding;
-                    } else if (a3Prev > paR) {
-                        // Right winding was added before, now add left winding.
+                        onPath = true;
+                    } else if (a3Prev > paL && a < paL) {
+                        // Left winding was not added before, so add it now.
                         windingL += winding;
+                        onPath = true;
                     }
-                    onPath = true;
                 }
                 // TODO: Determine how to handle quality when curve is crossed
                 // at starting point. Do we always need to set to 0?
@@ -655,17 +664,6 @@ PathItem.inject(new function() {
                 // it now to treat the path as closed:
                 if (vClose && (res = handleCurve(vClose)))
                     return res;
-                if (onPath && !windingL && !windingR) {
-                    // If the point is on the path and the windings canceled
-                    // each other, we treat the point as if it was inside the
-                    // path. A point inside a path has a winding of [+1,-1]
-                    // for clockwise and [-1,+1] for counter-clockwise paths.
-                    // If the ray is cast in y direction (dir == 1), the
-                    // windings always have opposite sign.
-                    var add = path.isClockwise(closed) ^ dir ? 1 : -1;
-                    windingL += add;
-                    windingR += add;
-                }
                 vClose = null;
             }
         }
@@ -797,10 +795,10 @@ PathItem.inject(new function() {
         // If there are multiple possible intersections, find the ones that's
         // either connecting back to start or are not visited yet, and will be
         // part of the boolean result:
-        function getIntersections(segment, collectStarts) {
+        function getCrossingSegments(segment, collectStarts) {
             var inter = segment._intersection,
                 start = inter,
-                inters = [];
+                crossings = [];
             if (collectStarts)
                 starts = [segment];
 
@@ -818,7 +816,7 @@ PathItem.inject(new function() {
                             // If the next segment isn't valid, its intersection
                             // to which we may switch might be, so check that.
                             || nextInter && isValid(nextInter._segment))))) {
-                        inters.push(inter);
+                        crossings.push(other);
                     }
                     if (collectStarts)
                         starts.push(other);
@@ -834,7 +832,7 @@ PathItem.inject(new function() {
                     inter = inter._prev;
                 collect(inter, start);
             }
-            return inters;
+            return crossings;
         }
 
         // Sort segments to give non-ambiguous segments the preference as
@@ -894,12 +892,11 @@ PathItem.inject(new function() {
             // visited, or that are not going to be part of the result).
             while (valid) {
                 // For each segment we encounter, see if there are multiple
-                // intersections, and if so, pick the best one:
+                // crossings, and if so, pick the best one:
                 var first = !path,
-                    intersections = getIntersections(seg, first),
-                    inter = intersections.shift(),
-                    // Get the other segment on the intersection.
-                    other = inter && inter._segment,
+                    crossings = getCrossingSegments(seg, first),
+                    // Get the other segment of the first found crossing.
+                    other = crossings.shift(),
                     finished = !first && (isStart(seg) || isStart(other)),
                     cross = !finished && other;
                 if (first) {
@@ -923,10 +920,13 @@ PathItem.inject(new function() {
                     branch = null;
                 }
                 if (!branch) {
+                    // Add the branch's root segment as the last segment to try,
+                    // to see if we get to a solution without crossing.
+                    if (cross)
+                        crossings.push(seg);
                     branch = {
                         start: path._segments.length,
-                        segment: seg,
-                        intersections: intersections,
+                        crossings: crossings,
                         visited: visited = [],
                         handleIn: handleIn
                     };
@@ -934,8 +934,8 @@ PathItem.inject(new function() {
                 if (cross)
                     seg = other;
                 // If an invalid segment is encountered, go back to the last
-                // crossing and try the other direction by not crossing at the
-                // intersection.
+                // crossing and try other possible crossings, as well as not
+                // crossing at the branch's root.
                 if (!isValid(seg)) {
                     // Remove the already added segments, and mark them as not
                     // visited so they become available again as options.
@@ -943,21 +943,25 @@ PathItem.inject(new function() {
                     for (var j = 0, k = visited.length; j < k; j++) {
                         visited[j]._visited = false;
                     }
-                    // Go back to the segment at which the crossing happened,
-                    // and try other crossings first.
-                    if (inter = branch.intersections.shift()) {
-                        seg = inter._segment;
-                        visited.length = 0;
-                    } else {
-                        // If there are no crossings left, try not crossing:
-                        // Restore the previous branch and keep adding to it,
-                        // but stop once we run out of branches to try.
-                        if (!(branch = branches.pop()) ||
-                            !isValid(seg = branch.segment))
-                            break;
-                        visited = branch.visited;
-                    }
-                    handleIn = branch.handleIn;
+                    visited.length = 0;
+                    // Go back to the branch's root segment where the crossing
+                    // happened, and try other crossings. Note that this also
+                    // tests the root segment without crossing as it is added to
+                    // the list of crossings when the branch is created above.
+                    do {
+                        seg = branch && branch.crossings.shift();
+                        if (!seg) {
+                            // If there are no segments left, try previous
+                            // branches until we find one that works.
+                            branch = branches.pop();
+                            if (branch) {
+                                visited = branch.visited;
+                                handleIn = branch.handleIn;
+                            }
+                        }
+                    } while (branch && !isValid(seg));
+                    if (!seg)
+                        break;
                 }
                 // Add the segment to the path, and mark it as visited.
                 // But first we need to look ahead. If we encounter the end of
@@ -1121,7 +1125,7 @@ PathItem.inject(new function() {
             var hasOverlaps = false,
                 hasCrossings = false,
                 intersections = this.getIntersections(null, function(inter) {
-                    return inter._overlap && (hasOverlaps = true) ||
+                    return inter.hasOverlap() && (hasOverlaps = true) ||
                             inter.isCrossing() && (hasCrossings = true);
                 }),
                 // We only need to keep track of curves that need clearing
@@ -1132,7 +1136,7 @@ PathItem.inject(new function() {
                 // First divide in all overlaps, and then remove the inside of
                 // the resulting overlap ranges.
                 var overlaps = divideLocations(intersections, function(inter) {
-                    return inter._overlap;
+                    return inter.hasOverlap();
                 }, clearCurves);
                 for (var i = overlaps.length - 1; i >= 0; i--) {
                     var seg = overlaps[i]._segment,
@@ -1160,20 +1164,23 @@ PathItem.inject(new function() {
                     // Check both involved curves to see if they're still valid,
                     // meaning they are still part of their paths.
                     var curve1 = inter.getCurve(),
-                        // Do not call getCurve() on the other intersection yet,
-                        // as it too is in the intersections array and will be
-                        // divided later. But do check if its current curve is
-                        // still valid. This is required by some very rare edge
+                        seg1 = inter.getSegment(),
+                        // Do not call getCurve() and getSegment() on the other
+                        // intersection yet, as it too is in the intersections
+                        // array and will be divided later. But check if its
+                        // current curve is valid, as required by some rare edge
                         // cases, related to intersections on the same curve.
-                        curve2 = inter._intersection._curve,
-                        seg = inter._segment;
-                    if (curve1 && curve2 && curve1._path && curve2._path) {
+                        other = inter._intersection,
+                        curve2 = other._curve,
+                        seg2 = other._segment;
+                    if (curve1 && curve2 && curve1._path && curve2._path)
                         return true;
-                    } else if (seg) {
-                        // Remove all intersections that were involved in the
-                        // handling of overlaps, to not confuse tracePaths().
-                        seg._intersection = null;
-                    }
+                    // Remove all intersections that were involved in the
+                    // handling of overlaps, to not confuse tracePaths().
+                    if (seg1)
+                        seg1._intersection = null;
+                    if (seg2)
+                        seg2._intersection = null;
                 }, clearCurves);
                 if (clearCurves)
                     clearCurveHandles(clearCurves);

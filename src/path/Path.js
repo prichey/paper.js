@@ -1199,10 +1199,9 @@ var Path = PathItem.extend(/** @lends Path# */{
                 this._add([segments[0]]);
             path.remove();
         }
-        // Close the resulting path and merge first and last segment if they
-        // touch, meaning the touched at path ends. Also do this if no path
-        // argument was provided, in which cases the path is joined with itself
-        // only if its ends touch.
+        // If the first and last segment touch, close the resulting path and
+        // merge the end segments. Also do this if no path argument was provided
+        // in which cases the path is joined with itself only if its ends touch.
         var first = this.getFirstSegment(),
             last = this.getLastSegment();
         if (first !== last && first._point.isClose(last._point, epsilon)) {
@@ -1674,7 +1673,7 @@ var Path = PathItem.extend(/** @lends Path# */{
             if (strokeRadius > 0) {
                 join = style.getStrokeJoin();
                 cap = style.getStrokeCap();
-                miterLimit = strokeRadius * style.getMiterLimit();
+                miterLimit = style.getMiterLimit();
                 // Add the stroke radius to tolerance padding, taking
                 // #strokeScaling into account through _getStrokeMatrix().
                 strokePadding = strokePadding.add(
@@ -1722,23 +1721,25 @@ var Path = PathItem.extend(/** @lends Path# */{
         }
 
         function checkSegmentStroke(segment) {
-            // Handle joins / caps that are not round specificelly, by
+            // Handle joins / caps that are not round specifically, by
             // hit-testing their polygon areas.
-            if (join !== 'round' || cap !== 'round') {
+            var isJoin = closed || segment._index > 0
+                    && segment._index < numSegments - 1;
+            if ((isJoin ? join : cap) === 'round') {
+                // Round join / cap is easy to handle.
+                return isCloseEnough(segment._point, strokePadding);
+            } else {
                 // Create an 'internal' path without id and outside the scene
                 // graph to run the hit-test on it.
                 area = new Path({ internal: true, closed: true });
-                if (closed || segment._index > 0
-                        && segment._index < numSegments - 1) {
-                    // It's a join. See that it's not a round one (one of
-                    // the handles has to be zero too for this!)
-                    if (join !== 'round' && (segment._handleIn.isZero()
-                            || segment._handleOut.isZero()))
-                        // _addBevelJoin() handles both 'bevel' and 'miter'!
+                if (isJoin) {
+                    // Only add bevels to segments that aren't smooth.
+                    if (!segment.isSmooth()) {
+                        // _addBevelJoin() handles both 'bevel' and 'miter'.
                         Path._addBevelJoin(segment, join, strokeRadius,
                                miterLimit, null, strokeMatrix, addToArea, true);
-                } else if (cap !== 'round') {
-                    // It's a cap
+                    }
+                } else if (cap === 'square') {
                     Path._addSquareCap(segment, cap, strokeRadius, null,
                             strokeMatrix, addToArea, true);
                 }
@@ -1753,8 +1754,6 @@ var Path = PathItem.extend(/** @lends Path# */{
                             && isCloseEnough(loc.getPoint(), tolerancePadding);
                 }
             }
-            // Fallback scenario is a round join / cap.
-            return isCloseEnough(segment._point, strokePadding);
         }
 
         // If we're asked to query for segments, ends or handles, do all that
@@ -1791,7 +1790,8 @@ var Path = PathItem.extend(/** @lends Path# */{
             if (!loc && join === 'miter' && numSegments > 1) {
                 for (var i = 0; i < numSegments; i++) {
                     var segment = segments[i];
-                    if (point.getDistance(segment._point) <= miterLimit
+                    if (point.getDistance(segment._point)
+                            <= miterLimit * strokeRadius
                             && checkSegmentStroke(segment)) {
                         loc = segment.getLocation();
                         break;
@@ -2403,7 +2403,9 @@ new function() { // PostScript-style drawing commands
         arcTo: function(/* to, clockwise | through, to
                 | to, radius, rotation, clockwise, large */) {
             // Get the start point:
-            var current = getCurrentSegment(this),
+            var abs = Math.abs,
+                sqrt = Math.sqrt,
+                current = getCurrentSegment(this),
                 from = current._point,
                 to = Point.read(arguments),
                 through,
@@ -2442,7 +2444,6 @@ new function() { // PostScript-style drawing commands
                     pt = from.subtract(middle).rotate(-rotation),
                     x = pt.x,
                     y = pt.y,
-                    abs = Math.abs,
                     rx = abs(radius.width),
                     ry = abs(radius.height),
                     rxSq = rx * rx,
@@ -2450,7 +2451,7 @@ new function() { // PostScript-style drawing commands
                     xSq = x * x,
                     ySq = y * y;
                 // "...ensure radii are large enough"
-                var factor = Math.sqrt(xSq / rxSq + ySq / rySq);
+                var factor = sqrt(xSq / rxSq + ySq / rySq);
                 if (factor > 1) {
                     rx *= factor;
                     ry *= factor;
@@ -2467,8 +2468,7 @@ new function() { // PostScript-style drawing commands
                 center = new Point(rx * y / ry, -ry * x / rx)
                         // "...where the + sign is chosen if fA != fS,
                         // and the - sign is chosen if fA = fS."
-                        .multiply((large === clockwise ? -1 : 1)
-                            * Math.sqrt(factor))
+                        .multiply((large === clockwise ? -1 : 1) * sqrt(factor))
                         .rotate(rotation).add(middle);
                 // Now create a matrix that maps the unit circle to the ellipse,
                 // for easier construction below.
@@ -2515,7 +2515,7 @@ new function() { // PostScript-style drawing commands
                     // If the center is lying on the line, we might have gotten
                     // the wrong sign for extent above. Use the sign of the side
                     // of the through point.
-                    extent = throughSide * Math.abs(extent);
+                    extent = throughSide * abs(extent);
                 } else if (throughSide === centerSide) {
                     // If the center is on the same side of the line (from, to)
                     // as the through point, we're extending bellow 180 degrees
@@ -2523,8 +2523,12 @@ new function() { // PostScript-style drawing commands
                     extent += extent < 0 ? 360 : -360;
                 }
             }
-            var ext = Math.abs(extent),
-                count = ext >= 360 ? 4 : Math.ceil(ext / 90),
+            var epsilon = /*#=*/Numerical.GEOMETRIC_EPSILON,
+                ext = abs(extent),
+                // Calculate the amount of segments required to approximate over
+                // `extend` degrees (extend / 90), but prevent ceil() from
+                // rounding up small imprecisions by subtracting epsilon first.
+                count = ext >= 360 ? 4 : Math.ceil((ext - epsilon) / 90),
                 inc = extent / count,
                 half = inc * Math.PI / 360,
                 z = 4 / 3 * Math.sin(half) / (1 + Math.cos(half)),
@@ -2692,7 +2696,7 @@ statics: {
         var strokeRadius = strokeWidth / 2,
             join = style.getStrokeJoin(),
             cap = style.getStrokeCap(),
-            miterLimit = strokeRadius * style.getMiterLimit(),
+            miterLimit = style.getMiterLimit(),
             // Create a rectangle of padding size, used for union with bounds
             // further down
             joinBounds = new Rectangle(new Size(strokePadding));
@@ -2711,12 +2715,10 @@ statics: {
         function addJoin(segment, join) {
             // When both handles are set in a segment and they are collinear,
             // the join setting is ignored and round is always used.
-            var handleIn = segment._handleIn,
-                handleOut = segment._handleOut;
-            if (join === 'round' || !handleIn.isZero() && !handleOut.isZero()
-                    && handleIn.isCollinear(handleOut)) {
+            if (join === 'round' || segment.isSmooth()) {
                 addRound(segment);
             } else {
+                    // _addBevelJoin() handles both 'bevel' and 'miter' joins.
                 Path._addBevelJoin(segment, join, strokeRadius, miterLimit,
                         matrix, strokeMatrix, addPoint);
             }
@@ -2726,6 +2728,7 @@ statics: {
             if (cap === 'round') {
                 addRound(segment);
             } else {
+                // _addSquareCap() handles both 'square' and 'butt' caps.
                 Path._addSquareCap(segment, cap, strokeRadius, matrix,
                         strokeMatrix, addPoint);
             }
@@ -2803,10 +2806,9 @@ statics: {
             normal1 = normal1.negate();
             normal2 = normal2.negate();
         }
-        if (isArea) {
+        if (isArea)
             addPoint(point);
-            addPoint(point.add(normal1));
-        }
+        addPoint(point.add(normal1));
         if (join === 'miter') {
             // Intersect the two lines
             var corner = new Line(point.add(normal1),
@@ -2816,15 +2818,11 @@ statics: {
                 ), true);
             // See if we actually get a bevel point and if its distance is below
             // the miterLimit. If not, make a normal bevel.
-            if (corner && point.getDistance(corner) <= miterLimit) {
+            if (corner && point.getDistance(corner) <= miterLimit * radius) {
                 addPoint(corner);
-                if (!isArea)
-                    return;
             }
         }
         // Produce a normal bevel
-        if (!isArea)
-            addPoint(point.add(normal1));
         addPoint(point.add(normal2));
     },
 
@@ -2836,20 +2834,20 @@ statics: {
         // Style#strokeScaling.
         var point = segment._point.transform(matrix),
             loc = segment.getLocation(),
-            // NOTE: normal is normalized, so multiply instead of normalize.
-            normal = loc.getNormal().multiply(radius).transform(strokeMatrix);
-        if (isArea) {
-            addPoint(point.subtract(normal));
-            addPoint(point.add(normal));
-        }
+            // Checking loc.getTime() for 0 is to see whether this is the first
+            // or the last segment of the open path, in order to determine in
+            // which direction to flip the normal.
+            normal = loc.getNormal()
+                    .multiply(loc.getTime() === 0 ? radius : -radius)
+                    .transform(strokeMatrix);
         // For square caps, we need to step away from point in the direction of
         // the tangent, which is the rotated normal.
-        // Checking loc.getTime() for 0 is to see whether this is the first
-        // or the last segment of the open path, in order to determine in which
-        // direction to move the point.
         if (cap === 'square') {
-            point = point.add(normal.rotate(
-                    loc.getTime() === 0 ? -90 : 90));
+            if (isArea) {
+                addPoint(point.subtract(normal));
+                addPoint(point.add(normal));
+            }
+            point = point.add(normal.rotate(-90));
         }
         addPoint(point.add(normal));
         addPoint(point.subtract(normal));

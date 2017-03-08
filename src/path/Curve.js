@@ -525,7 +525,8 @@ var Curve = Base.extend(/** @lends Curve# */{
      * @see Path#splitAt(offset)
      */
     splitAt: function(location) {
-        return this._path ? this._path.splitAt(location) : null;
+        var path = this._path;
+        return path ? path.splitAt(location) : null;
     },
 
     /**
@@ -538,8 +539,8 @@ var Curve = Base.extend(/** @lends Curve# */{
      * @return {Path} the newly created path after splitting, if any
      * @see Path#splitAt(offset)
      */
-    splitAtTime: function(t) {
-        return this.splitAt(this.getLocationAtTime(t));
+    splitAtTime: function(time) {
+        return this.splitAt(this.getLocationAtTime(time));
     },
 
     // TODO: Remove in 1.0.0? (deprecated January 2016):
@@ -955,51 +956,58 @@ statics: /** @lends Curve */{
      * @ignore
      */
 }), Base.each({ // Injection scope for tests both as instance and static methods
-    isStraight: function(l, h1, h2) {
+    // NOTE: Curve#isStraight is documented further down.
+    isStraight: function(p1, h1, h2, p2) {
         if (h1.isZero() && h2.isZero()) {
             // No handles.
             return true;
         } else {
-            var v = l.getVector(),
-                epsilon = /*#=*/Numerical.GEOMETRIC_EPSILON;
+            var v = p2.subtract(p1);
             if (v.isZero()) {
                 // Zero-length line, with some handles defined.
                 return false;
-            } else if (l.getDistance(h1) < epsilon
-                    && l.getDistance(h2) < epsilon) {
-                // Collinear handles: Instead of v.isCollinear(h1) checks, we
+            } else if (v.isCollinear(h1) && v.isCollinear(h2)) {
+                // Collinear handles: In addition to v.isCollinear(h) checks, we
                 // need to measure the distance to the line, in order to be able
                 // to use the same epsilon as in Curve#getTimeOf(), see #1066.
-                // Project them onto line to see if they are within its range:
-                var div = v.dot(v),
-                    p1 = v.dot(h1) / div,
-                    p2 = v.dot(h2) / div;
-                return p1 >= 0 && p1 <= 1 && p2 <= 0 && p2 >= -1;
+                var l = new Line(p1, p2),
+                    epsilon = /*#=*/Numerical.GEOMETRIC_EPSILON;
+                if (l.getDistance(p1.add(h1)) < epsilon &&
+                    l.getDistance(p2.add(h2)) < epsilon) {
+                    // Project handles onto line to see if they are in range:
+                    var div = v.dot(v),
+                        s1 = v.dot(h1) / div,
+                        s2 = v.dot(h2) / div;
+                    return s1 >= 0 && s1 <= 1 && s2 <= 0 && s2 >= -1;
+                }
             }
         }
         return false;
     },
 
-    isLinear: function(l, h1, h2) {
-        var third = l.getVector().divide(3);
+    // NOTE: Curve#isLinear is documented further down.
+    isLinear: function(p1, h1, h2, p2) {
+        var third = p2.subtract(p1).divide(3);
         return h1.equals(third) && h2.negate().equals(third);
     }
 }, function(test, name) {
     // Produce the instance version that is called on curve object.
-    this[name] = function() {
+    this[name] = function(epsilon) {
         var seg1 = this._segment1,
             seg2 = this._segment2;
-        return test(new Line(seg1._point, seg2._point),
-                seg1._handleOut, seg2._handleIn);
+        return test(seg1._point, seg1._handleOut, seg2._handleIn, seg2._point,
+                epsilon);
     };
 
     // Produce the static version that handles a curve values array.
-    this.statics[name] = function(v) {
+    this.statics[name] = function(v, epsilon) {
         var x0 = v[0], y0 = v[1],
             x3 = v[6], y3 = v[7];
-        return test(new Line(x0, y0, x3, y3),
+        return test(
+                new Point(x0, y0),
                 new Point(v[2] - x0, v[3] - y0),
-                new Point(v[4] - x3, v[5] - y3));
+                new Point(v[4] - x3, v[5] - y3),
+                new Point(x3, y3), epsilon);
     };
 }, /** @lends Curve# */{
     statics: {}, // Filled in the Base.each loop above.
@@ -1028,10 +1036,7 @@ statics: /** @lends Curve */{
      * @return {Boolean} {@true if the curve is longer than the given epsilon}
      */
     hasLength: function(epsilon) {
-        var seg1 = this._segment1,
-            seg2 = this._segment2;
-        return (!seg1._point.equals(seg2._point)
-                    || seg1.hasHandles() || seg2.hasHandles())
+        return (!this.getPoint1().equals(this.getPoint2()) || this.hasHandles())
                 && this.getLength() > (epsilon || 0);
     },
 
@@ -1711,8 +1716,7 @@ new function() { // Scope for methods that require private functions
 },
 new function() { // Scope for bezier intersection using fat-line clipping
 
-    function addLocation(locations, include, v1, c1, t1, p1, v2, c2, t2, p2,
-            overlap) {
+    function addLocation(locations, include, c1, t1, p1, c2, t2, p2, overlap) {
         // Determine if locations at the beginning / end of the curves should be
         // excluded, in case the two curves are neighbors, but do not exclude
         // connecting points between two curves if they were part of overlap
@@ -1722,7 +1726,7 @@ new function() { // Scope for bezier intersection using fat-line clipping
             tMin = /*#=*/Numerical.CURVETIME_EPSILON,
             tMax = 1 - tMin;
         if (t1 == null)
-            t1 = Curve.getTimeOf(v1, p1);
+            t1 = c1.getTimeOf(p1);
         // Check t1 and t2 against correct bounds, based on excludeStart/End:
         // - excludeStart means the start of c1 connects to the end of c2
         // - excludeEnd means the end of c1 connects to the start of c2
@@ -1733,40 +1737,34 @@ new function() { // Scope for bezier intersection using fat-line clipping
         if (t1 !== null && t1 >= (excludeStart ? tMin : 0) &&
             t1 <= (excludeEnd ? tMax : 1)) {
             if (t2 == null)
-                t2 = Curve.getTimeOf(v2, p2);
+                t2 = c2.getTimeOf(p2);
             if (t2 !== null && t2 >= (excludeEnd ? tMin : 0) &&
                 t2 <= (excludeStart ? tMax : 1)) {
                 var loc1 = new CurveLocation(c1, t1,
-                        p1 || Curve.getPoint(v1, t1), overlap),
+                        p1 || c1.getPointAtTime(t1), overlap),
                     loc2 = new CurveLocation(c2, t2,
-                        p2 || Curve.getPoint(v2, t2), overlap),
-                    // For self-intersections, detect the case where the second
-                    // curve wrapped around, and flip them so they can get
-                    // matched to a potentially already existing intersection.
-                    flip = loc1.getPath() === loc2.getPath()
-                        && loc1.getIndex() > loc2.getIndex(),
-                    loc = flip ? loc2 : loc1;
+                        p2 || c2.getPointAtTime(t2), overlap);
                 // Link the two locations to each other.
                 loc1._intersection = loc2;
                 loc2._intersection = loc1;
-                if (!include || include(loc)) {
-                    CurveLocation.insert(locations, loc, true);
+                if (!include || include(loc1)) {
+                    CurveLocation.insert(locations, loc1, true);
                 }
             }
         }
     }
 
-    function addCurveIntersections(v1, v2, c1, c2, locations, include,
-            tMin, tMax, uMin, uMax, flip, recursion, calls) {
+    function addCurveIntersections(v1, v2, c1, c2, locations, include, flip,
+            recursion, calls, tMin, tMax, uMin, uMax) {
         // Avoid deeper recursion, by counting the total amount of recursions,
         // as well as the total amount of calls, to avoid massive call-trees as
         // suggested by @iconexperience in #904#issuecomment-225283430.
         // See also: #565 #899 #1074
-        if (++recursion >= 48 || ++calls > 4096)
+        if (++calls >= 4096 || ++recursion >= 40)
             return calls;
         // Use an epsilon smaller than CURVETIME_EPSILON to compare curve-time
         // parameters in fat-line clipping code.
-        var epsilon = /*#=*/Numerical.EPSILON,
+        var fatLineEpsilon = 1e-9,
             // Let P be the first curve and Q be the second
             q0x = v2[0], q0y = v2[1], q3x = v2[6], q3y = v2[7],
             getSignedDistance = Line.getSignedDistance,
@@ -1803,17 +1801,13 @@ new function() { // Scope for bezier intersection using fat-line clipping
         // original parameter range for v2.
         var tMinNew = tMin + (tMax - tMin) * tMinClip,
             tMaxNew = tMin + (tMax - tMin) * tMaxClip;
-        if (Math.max(uMax - uMin, tMaxNew - tMinNew) < epsilon) {
+        if (Math.max(uMax - uMin, tMaxNew - tMinNew) < fatLineEpsilon) {
             // We have isolated the intersection with sufficient precision
             var t = (tMinNew + tMaxNew) / 2,
                 u = (uMin + uMax) / 2;
-            // As v1 and v2 were clipped, reset them again to the original
-            // curve values to match the parameter space of t1 and t2:
-            v1 = c1.getValues();
-            v2 = c2.getValues();
             addLocation(locations, include,
-                    flip ? v2 : v1, flip ? c2 : c1, flip ? u : t, null,
-                    flip ? v1 : v2, flip ? c1 : c2, flip ? t : u, null);
+                    flip ? c2 : c1, flip ? u : t, null,
+                    flip ? c1 : c2, flip ? t : u, null);
         } else {
             // Apply the result of the clipping to curve 1:
             v1 = Curve.getPart(v1, tMinClip, tMaxClip);
@@ -1823,32 +1817,32 @@ new function() { // Scope for bezier intersection using fat-line clipping
                     var parts = Curve.subdivide(v1, 0.5),
                         t = (tMinNew + tMaxNew) / 2;
                     calls = addCurveIntersections(
-                            v2, parts[0], c2, c1, locations, include,
-                            uMin, uMax, tMinNew, t, !flip, recursion, calls);
+                            v2, parts[0], c2, c1, locations, include, !flip,
+                            recursion, calls, uMin, uMax, tMinNew, t);
                     calls = addCurveIntersections(
-                            v2, parts[1], c2, c1, locations, include,
-                            uMin, uMax, t, tMaxNew, !flip, recursion, calls);
+                            v2, parts[1], c2, c1, locations, include, !flip,
+                            recursion, calls, uMin, uMax, t, tMaxNew);
                 } else {
                     var parts = Curve.subdivide(v2, 0.5),
                         u = (uMin + uMax) / 2;
                     calls = addCurveIntersections(
-                            parts[0], v1, c2, c1, locations, include,
-                            uMin, u, tMinNew, tMaxNew, !flip, recursion, calls);
+                            parts[0], v1, c2, c1, locations, include, !flip,
+                            recursion, calls, uMin, u, tMinNew, tMaxNew);
                     calls = addCurveIntersections(
-                            parts[1], v1, c2, c1, locations, include,
-                            u, uMax, tMinNew, tMaxNew, !flip, recursion, calls);
+                            parts[1], v1, c2, c1, locations, include, !flip,
+                            recursion, calls, u, uMax, tMinNew, tMaxNew);
                 }
             } else { // Iterate
-                if (uMax - uMin >= epsilon) {
+                if (uMax - uMin >= fatLineEpsilon) {
                     calls = addCurveIntersections(
-                        v2, v1, c2, c1, locations, include,
-                        uMin, uMax, tMinNew, tMaxNew, !flip, recursion, calls);
+                            v2, v1, c2, c1, locations, include, !flip,
+                            recursion, calls, uMin, uMax, tMinNew, tMaxNew);
                 } else {
                     // The interval on the other curve is already tight enough,
                     // therefore we keep iterating on the same curve.
                     calls = addCurveIntersections(
-                        v1, v2, c1, c2, locations, include,
-                        tMinNew, tMaxNew, uMin, uMax, flip, recursion, calls);
+                            v1, v2, c1, c2, locations, include, flip,
+                            recursion, calls, tMinNew, tMaxNew, uMin, uMax);
                 }
             }
         }
@@ -1950,6 +1944,13 @@ new function() { // Scope for bezier intersection using fat-line clipping
      * and the curve.
      */
     function getCurveLineIntersections(v, px, py, vx, vy) {
+        var isZero = Numerical.isZero;
+        if (isZero(vx) && isZero(vy)) {
+            // Handle special case of a line with no direction as a point,
+            // and check if it is on the curve.
+            var t = Curve.getTimeOf(v, new Point(px, py));
+            return t === null ? [] : [t];
+        }
         // Calculate angle to the x-axis (1, 0).
         var angle = Math.atan2(-vy, vx),
             sin = Math.sin(angle),
@@ -1971,26 +1972,29 @@ new function() { // Scope for bezier intersection using fat-line clipping
         return roots;
     }
 
-    function addCurveLineIntersections(v1, v2, c1, c2, locations, include) {
-        var flip = Curve.isStraight(v1),
-            vc = flip ? v2 : v1,
-            vl = flip ? v1 : v2,
-            x1 = vl[0], y1 = vl[1],
-            x2 = vl[6], y2 = vl[7],
-            roots = getCurveLineIntersections(vc, x1, y1, x2 - x1, y2 - y1);
+    function addCurveLineIntersections(v1, v2, c1, c2, locations, include,
+            flip) {
+        // addCurveLineIntersections() is called so that v1 is always the curve
+        // and v2 the line. flip indicates whether the curves need to be flipped
+        // in the call to addLocation().
+        var x1 = v2[0], y1 = v2[1],
+            x2 = v2[6], y2 = v2[7],
+            roots = getCurveLineIntersections(v1, x1, y1, x2 - x1, y2 - y1);
         // NOTE: count could be -1 for infinite solutions, but that should only
         // happen with lines, in which case we should not be here.
         for (var i = 0, l = roots.length; i < l; i++) {
             // For each found solution on the rotated curve, get the point on
             // the real curve and with that the location on the line.
-            var tc = roots[i],
-                pc = Curve.getPoint(vc, tc),
-                tl = Curve.getTimeOf(vl, pc);
-            if (tl !== null) {
-                var pl = Curve.getPoint(vl, tl);
+            var t1 = roots[i],
+                p1 = Curve.getPoint(v1, t1),
+                t2 = Curve.getTimeOf(v2, p1);
+            if (t2 !== null) {
+                var p2 = Curve.getPoint(v2, t2);
+                // Only use the time values if there was no recursion, and let
+                // addLocation() figure out the actual time values otherwise.
                 addLocation(locations, include,
-                        v1, c1, flip ? tl : tc, flip ? pl : pc,
-                        v2, c2, flip ? tc : tl, flip ? pc : pl);
+                        flip ? c2 : c1, flip ? t2 : t1, flip ? p2 : p1,
+                        flip ? c1 : c2, flip ? t1 : t2, flip ? p1 : p2);
             }
         }
     }
@@ -2000,7 +2004,7 @@ new function() { // Scope for bezier intersection using fat-line clipping
                 v1[0], v1[1], v1[6], v1[7],
                 v2[0], v2[1], v2[6], v2[7]);
         if (pt) {
-            addLocation(locations, include, v1, c1, null, pt, v2, c2, null, pt);
+            addLocation(locations, include, c1, null, pt, c2, null, pt);
         }
     }
 
@@ -2009,43 +2013,45 @@ new function() { // Scope for bezier intersection using fat-line clipping
         var epsilon = /*#=*/Numerical.EPSILON,
             min = Math.min,
             max = Math.max;
-        if (!(  max(v1[0], v1[2], v1[4], v1[6]) + epsilon >
-                min(v2[0], v2[2], v2[4], v2[6]) &&
-                min(v1[0], v1[2], v1[4], v1[6]) - epsilon <
-                max(v2[0], v2[2], v2[4], v2[6]) &&
-                max(v1[1], v1[3], v1[5], v1[7]) + epsilon >
-                min(v2[1], v2[3], v2[5], v2[7]) &&
-                min(v1[1], v1[3], v1[5], v1[7]) - epsilon <
-                max(v2[1], v2[3], v2[5], v2[7])))
-            return locations;
 
-        // Now detect and handle overlaps:
-        var overlaps = getOverlaps(v1, v2);
-        if (overlaps) {
-            for (var i = 0; i < 2; i++) {
-                var overlap = overlaps[i];
-                addLocation(locations, include,
-                    v1, c1, overlap[0], null,
-                    v2, c2, overlap[1], null, true);
+        if (max(v1[0], v1[2], v1[4], v1[6]) + epsilon >
+            min(v2[0], v2[2], v2[4], v2[6]) &&
+            min(v1[0], v1[2], v1[4], v1[6]) - epsilon <
+            max(v2[0], v2[2], v2[4], v2[6]) &&
+            max(v1[1], v1[3], v1[5], v1[7]) + epsilon >
+            min(v2[1], v2[3], v2[5], v2[7]) &&
+            min(v1[1], v1[3], v1[5], v1[7]) - epsilon <
+            max(v2[1], v2[3], v2[5], v2[7])) {
+            // Now detect and handle overlaps:
+            var overlaps = getOverlaps(v1, v2);
+            if (overlaps) {
+                for (var i = 0; i < 2; i++) {
+                    var overlap = overlaps[i];
+                    addLocation(locations, include,
+                            c1, overlap[0], null,
+                            c2, overlap[1], null, true);
+                }
+            } else {
+                var straight1 = Curve.isStraight(v1),
+                    straight2 = Curve.isStraight(v2),
+                    straight = straight1 && straight2,
+                    flip = straight1 && !straight2;
+                // Determine the correct intersection method based on whether
+                // one or curves are straight lines:
+                (straight
+                    ? addLineIntersection
+                    : straight1 || straight2
+                        ? addCurveLineIntersections
+                        : addCurveIntersections)(
+                            flip ? v2 : v1, flip ? v1 : v2,
+                            flip ? c2 : c1, flip ? c1 : c2,
+                            locations, include, flip,
+                            // Define the defaults for these parameters of
+                            // addCurveIntersections():
+                            // recursion, calls, tMin, tMax, uMin, uMax
+                            0, 0, 0, 1, 0, 1);
             }
-            return locations;
         }
-
-        var straight1 = Curve.isStraight(v1),
-            straight2 = Curve.isStraight(v2),
-            straight = straight1 && straight2;
-        // Determine the correct intersection method based on whether one or
-        // curves are straight lines:
-        (straight
-            ? addLineIntersection
-            : straight1 || straight2
-                ? addCurveLineIntersections
-                : addCurveIntersections)(
-                    v1, v2, c1, c2, locations, include,
-                    // Define the defaults for these parameters of
-                    // addCurveIntersections():
-                    // tMin, tMax, uMin, uMax, flip, recursion, calls
-                    0, 1, 0, 1, 0, 0, 0);
         return locations;
     }
 
@@ -2054,8 +2060,8 @@ new function() { // Scope for bezier intersection using fat-line clipping
         if (info.type === 'loop') {
             var roots = info.roots;
             addLocation(locations, include,
-                v1, c1, roots[0], null,
-                v1, c1, roots[1], null);
+                    c1, roots[0], null,
+                    c1, roots[1], null);
         }
       return locations;
     }
@@ -2193,8 +2199,8 @@ new function() { // Scope for bezier intersection using fat-line clipping
         if (pairs.length !== 2) {
             pairs = null;
         } else if (!straightBoth) {
-            // Straight pairs don't need further checks. If we found
-            // 2 pairs, the end points on v1 & v2 should be the same.
+            // Straight pairs don't need further checks. If we found 2 pairs,
+            // the end points on v1 & v2 should be the same.
             var o1 = Curve.getPart(v1, pairs[0][0], pairs[1][0]),
                 o2 = Curve.getPart(v2, pairs[0][1], pairs[1][1]);
             // Check if handles of the overlapping curves are the same too.

@@ -89,10 +89,10 @@ var CurveLocation = Base.extend(/** @lends CurveLocation# */{
      */
     getSegment: function() {
         // Request curve first, so _segment gets invalidated if it's out of sync
-        var curve = this.getCurve(),
-            segment = this._segment;
+        var segment = this._segment;
         if (!segment) {
-            var time = this.getTime();
+            var curve = this.getCurve(),
+                time = this.getTime();
             if (time === 0) {
                 segment = curve._segment1;
             } else if (time === 1) {
@@ -119,10 +119,9 @@ var CurveLocation = Base.extend(/** @lends CurveLocation# */{
         var path = this._path,
             that = this;
         if (path && path._version !== this._version) {
-            // If the path's segments have changed in the meantime, clear the
-            // internal _time value and force re-fetching of the correct
-            // curve again here.
-            this._time = this._curve = this._offset = null;
+            // If the path's segments have changed, clear the cached time and
+            // offset values and force re-fetching of the correct curve.
+            this._time = this._offset = this._curveOffset = this._curve = null;
         }
 
         // If path is out of sync, access current curve objects through segment1
@@ -134,7 +133,6 @@ var CurveLocation = Base.extend(/** @lends CurveLocation# */{
             if (curve && (that._time = curve.getTimeOf(that._point)) != null) {
                 // Fetch path again as it could be on a new one through split()
                 that._setCurve(curve);
-                that._segment = segment;
                 return curve;
             }
         }
@@ -142,7 +140,6 @@ var CurveLocation = Base.extend(/** @lends CurveLocation# */{
         return this._curve
             || trySegment(this._segment)
             || trySegment(this._segment1)
-            || trySegment(this._segment1.getNext())
             || trySegment(this._segment2.getPrevious());
     },
 
@@ -235,9 +232,14 @@ var CurveLocation = Base.extend(/** @lends CurveLocation# */{
      * @type Number
      */
     getCurveOffset: function() {
-        var curve = this.getCurve(),
-            time = this.getTime();
-        return time != null && curve && curve.getPartLength(0, time);
+        var offset = this._curveOffset;
+        if (offset == null) {
+            var curve = this.getCurve(),
+                time = this.getTime();
+            this._curveOffset = offset = time != null && curve
+                    && curve.getPartLength(0, time);
+        }
+        return offset;
     },
 
     /**
@@ -292,17 +294,23 @@ var CurveLocation = Base.extend(/** @lends CurveLocation# */{
 
     divide: function() {
         var curve = this.getCurve(),
-            res = null;
+            res = curve && curve.divideAtTime(this.getTime());
         // Change to the newly inserted segment, also adjusts _time.
-        if (curve && (res = curve.divideAtTime(this.getTime()))) {
+        if (res) {
             this._setSegment(res._segment1);
         }
         return res;
     },
 
     split: function() {
-        var curve = this.getCurve();
-        return curve ? curve.splitAtTime(this.getTime()) : null;
+        var curve = this.getCurve(),
+            path = curve._path,
+            res = curve && curve.splitAtTime(this.getTime());
+        if (res) {
+            // Set the segment to the end-segment of the path after splitting.
+            this._setSegment(path.getLastSegment());
+        }
+        return  res;
     },
 
     /**
